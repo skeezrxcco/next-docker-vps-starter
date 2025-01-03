@@ -1,0 +1,71 @@
+services:
+  web:
+    build: 
+      context: .
+      dockerfile: Dockerfile.dev
+      target: development
+    expose:
+      - "${APP_PORT:-3000}"
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+      - NODE_ENV=${NODE_ENV:-development}
+      - APP_PORT=${APP_PORT:-3000}
+      - WATCHPACK_POLLING=true
+      - CHOKIDAR_USEPOLLING=true
+      - NEXT_WEBPACK_USEPOLLING=1
+    volumes:
+      - .:/app
+      - /app/node_modules
+      - /app/.next
+    command: >
+      sh -c "npx prisma generate &&
+             npx prisma migrate deploy &&
+             npm run dev"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - app_network
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "${NGINX_PORT:-80}:80"
+      - "${NGINX_ALT_PORT:-8080}:8080"
+    volumes:
+      - ./nginx/nginx.conf.template:/etc/nginx/nginx.conf.template:ro
+    command: /bin/sh -c "envsubst '$$APP_PORT $$NGINX_PORT $$NGINX_ALT_PORT $$DEV_HOST' < /etc/nginx/nginx.conf.template > /etc/nginx/nginx.conf && nginx -g 'daemon off;'"
+    environment:
+      - APP_PORT=${APP_PORT:-3000}
+      - NGINX_PORT=${NGINX_PORT:-80}
+      - NGINX_ALT_PORT=${NGINX_ALT_PORT:-8080}
+      - DEV_HOST=${DEV_HOST:-localhost}
+    depends_on:
+      - web
+    networks:
+      - app_network
+
+  db:
+    image: postgres:15
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
+      - POSTGRES_DB=${POSTGRES_DB:-app_db}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - app_network
+
+volumes:
+  postgres_data:
+
+networks:
+  app_network:
+    driver: bridge

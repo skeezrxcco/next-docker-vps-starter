@@ -1,0 +1,29 @@
+events {
+    worker_connections 1024;
+}
+
+http {
+    upstream app_upstream {
+        server web:${APP_PORT};
+    }
+
+    server {
+        listen ${NGINX_PORT};
+        listen ${NGINX_ALT_PORT};
+        server_name ${DEV_HOST};
+
+        location / {
+            proxy_pass http://app_upstream;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection 'upgrade';
+            proxy_set_header Host $host;
+            proxy_cache_bypass $http_upgrade;
+            
+            # Development-specific headers
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+    }
+}

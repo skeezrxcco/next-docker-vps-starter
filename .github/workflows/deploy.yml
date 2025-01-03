@@ -1,0 +1,209 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build application
+        run: npm run build
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Deploy to VPS
+        uses: appleboy/ssh-action@master
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_TAG: ${{ steps.meta.outputs.tags }}
+          POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
+          PRODUCTION_DOMAIN: adhdadd.org
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: 22
+          envs: GHCR_TOKEN,IMAGE_TAG,POSTGRES_USER,POSTGRES_PASSWORD,POSTGRES_DB,PRODUCTION_DOMAIN
+          script: |
+            # Create app directory if it doesn't exist
+            mkdir -p ~/nextjs-vps-2/nginx
+            cd ~/nextjs-vps-2
+
+            # Login to GitHub Container Registry
+            echo $GHCR_TOKEN | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            
+            # Pull the latest image
+            docker pull $IMAGE_TAG
+            
+            # Create docker-compose.prod.yml with expanded variables
+            cat > docker-compose.prod.yml << EOL
+            version: '3.8'
+
+            services:
+              web:
+                image: ${IMAGE_TAG}
+                restart: always
+                environment:
+                  - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}?schema=public
+                  - NODE_ENV=production
+                depends_on:
+                  db:
+                    condition: service_healthy
+                  migrations:
+                    condition: service_completed_successfully
+                networks:
+                  - app_network
+
+              migrations:
+                image: ${IMAGE_TAG}
+                command: >
+                  sh -c '
+                    echo "Waiting for database..." &&
+                    while ! nc -z db 5432; do sleep 1; done &&
+                    echo "Database is ready!" &&
+                    npx prisma migrate deploy &&
+                    echo "Migrations completed!"
+                  '
+                environment:
+                  - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}?schema=public
+                  - NODE_ENV=production
+                depends_on:
+                  db:
+                    condition: service_healthy
+                networks:
+                  - app_network
+
+              nginx:
+                image: nginx:alpine
+                restart: always
+                ports:
+                  - "80:80"
+                  - "443:443"
+                volumes:
+                  - ./nginx/nginx.prod.conf:/etc/nginx/nginx.conf:ro
+                  - /etc/letsencrypt:/etc/letsencrypt:ro
+                depends_on:
+                  - web
+                networks:
+                  - app_network
+
+              db:
+                image: postgres:15-alpine
+                restart: always
+                environment:
+                  - POSTGRES_USER=${POSTGRES_USER}
+                  - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+                  - POSTGRES_DB=${POSTGRES_DB}
+                volumes:
+                  - postgres_data:/var/lib/postgresql/data
+                networks:
+                  - app_network
+                healthcheck:
+                  test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+                  interval: 5s
+                  timeout: 5s
+                  retries: 5
+
+            volumes:
+              postgres_data:
+
+            networks:
+              app_network:
+                driver: bridge
+            EOL
+            
+            # Create nginx.prod.conf
+            cat > nginx/nginx.prod.conf << EOL
+            events {
+                worker_connections 1024;
+            }
+
+            http {
+                include /etc/nginx/mime.types;
+                default_type application/octet-stream;
+
+                upstream nextjs_upstream {
+                    server web:3000;
+                }
+
+                server {
+                    listen 80;
+                    server_name adhdadd.org;
+                    return 301 https://\$server_name\$request_uri;
+                }
+
+                server {
+                    listen 443 ssl;
+                    server_name adhdadd.org;
+
+                    ssl_certificate /etc/letsencrypt/live/adhdadd.org/fullchain.pem;
+                    ssl_certificate_key /etc/letsencrypt/live/adhdadd.org/privkey.pem;
+
+                    location / {
+                        proxy_pass http://nextjs_upstream;
+                        proxy_http_version 1.1;
+                        proxy_set_header Upgrade \$http_upgrade;
+                        proxy_set_header Connection 'upgrade';
+                        proxy_set_header Host \$host;
+                        proxy_cache_bypass \$http_upgrade;
+                        proxy_set_header X-Real-IP \$remote_addr;
+                        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                        proxy_set_header X-Forwarded-Proto \$scheme;
+                    }
+                }
+            }
+            EOL
+            
+            # Stop and remove all containers
+            docker-compose -f docker-compose.prod.yml down -v
+            
+            # Start the application
+            docker-compose -f docker-compose.prod.yml pull
+            docker-compose -f docker-compose.prod.yml up -d
+            
+            # Clean up old images
+            docker system prune -f
